@@ -1,0 +1,38 @@
+{
+  "name": "tradebot",
+  "version": "1.0.0",
+  "description": "AI-powered crypto trading bot for macOS",
+  "main": "src/main.js",
+  "author": "TradeBot",
+  "license": "MIT",
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron . --dev",
+    "setup-backend": "cd backend && python3 -m venv venv && venv/bin/pip install -r requirements.txt",
+    "build": "electron-builder --mac"
+  },
+  "devDependencies": {
+    "electron": "^28.0.0",
+    "electron-builder": "^24.0.0"
+  },
+  "build": {
+    "appId": "com.tradebot.app",
+    "productName": "TradeBot",
+    "mac": {
+      "category": "public.app-category.finance",
+      "target": ["dmg", "zip"],
+      "icon": "assets/icon.icns"
+    },
+    "files": [
+      "src/**",
+      "frontend/**",
+      "backend/**",
+      "!backend/venv",
+      "!backend/__pycache__",
+      "!backend/*.db"
+    ],
+    "extraResources": [
+      { "from": "backend", "to": "backend" }
+    ]
+  }
+}

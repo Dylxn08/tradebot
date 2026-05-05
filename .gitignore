@@ -1,0 +1,27 @@
+# Credentials — never commit these
+backend/settings.json
+backend/.env
+
+# Python
+backend/venv/
+backend/__pycache__/
+backend/*.pyc
+backend/*.pyo
+
+# Databases
+backend/*.db
+*.db
+
+# Node
+node_modules/
+package-lock.json
+
+# Electron build output
+dist/
+out/
+
+# macOS
+.DS_Store
+
+# Logs
+*.log

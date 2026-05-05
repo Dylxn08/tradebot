@@ -1,0 +1,33 @@
+{
+  "paper_trading": true,
+  "paper_balance": 1000,
+  "trading_budget_usd": 100.0,
+  "trade_amount_pct": 0.05,
+  "min_confidence": 0.58,
+  "poll_interval_sec": 30,
+  "ollama_host": "http://localhost:11434",
+  "ollama_model": "qwen2.5:14b",
+  "pairs": [
+    "BTC-USD",
+    "ETH-USD",
+    "SOL-USD",
+    "XRP-USD",
+    "DOGE-USD",
+    "ADA-USD",
+    "AVAX-USD",
+    "LINK-USD",
+    "LTC-USD"
+  ],
+  "coinbase_api_key": "organizations/YOUR_ORG_ID/apiKeys/YOUR_KEY_ID",
+  "coinbase_api_secret": "-----BEGIN EC PRIVATE KEY-----\\nYOUR_KEY_HERE\\n-----END EC PRIVATE KEY-----\\n",
+  "news_enabled": true,
+  "news_interval_sec": 300,
+  "learning_enabled": true,
+  "outcome_eval_min": 10,
+  "auto_start_bot": false,
+  "open_at_login": false,
+  "take_profit_pct": 2.0,
+  "stop_loss_pct": 1.5,
+  "shadow_paper_enabled": true,
+  "shadow_paper_balance": 500.0
+}
