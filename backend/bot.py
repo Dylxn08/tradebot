@@ -31,29 +31,35 @@ from flask_cors import CORS
 # ─── Settings ─────────────────────────────────────────────────────────────────
 SETTINGS_FILE = Path(__file__).parent / "settings.json"
 
+TAKER_FEE = 0.006  # 0.6% Coinbase Advanced Trade taker fee per side
+
 DEFAULTS = {
-    "paper_trading":       True,
-    "paper_balance":       100.0,
-    "trading_budget_usd":  100.0,
-    "trade_amount_pct":    0.05,
-    "min_confidence":      0.58,
-    "poll_interval_sec":   30,
-    "ollama_host":         "http://localhost:11434",
-    "ollama_model":        "qwen2.5:14b",
+    "paper_trading":        True,
+    "paper_balance":        100.0,
+    "trading_budget_usd":   100.0,
+    "trade_amount_pct":     0.05,
+    "min_confidence":       0.58,
+    "poll_interval_sec":    600,
+    "ollama_host":          "http://localhost:11434",
+    "ollama_model":         "qwen2.5:14b",
     "pairs": [
         "BTC-USD","ETH-USD","SOL-USD","XRP-USD","DOGE-USD",
         "ADA-USD","AVAX-USD","LINK-USD","LTC-USD"
     ],
-    "coinbase_api_key":    "",
-    "coinbase_api_secret": "",
-    "news_enabled":        True,
-    "news_interval_sec":   300,
-    "learning_enabled":    True,
-    "outcome_eval_min":    10,
-    "auto_start_bot":      False,
-    "open_at_login":       False,
-    "take_profit_pct":     2.0,
-    "stop_loss_pct":       1.5,
+    "coinbase_api_key":     "",
+    "coinbase_api_secret":  "",
+    "news_enabled":         True,
+    "news_interval_sec":    300,
+    "learning_enabled":     True,
+    "outcome_eval_min":     10,
+    "auto_start_bot":       False,
+    "open_at_login":        False,
+    "stop_loss_pct":        1.5,
+    "partial_tp_pct":       3.0,
+    "trailing_stop_pct":    2.0,
+    "daily_loss_limit_pct": 3.0,
+    "max_positions":        1,
+    "trading_hours_utc":    [0, 24],
     "shadow_paper_enabled": True,
     "shadow_paper_balance": 500.0,
 }
@@ -153,6 +159,18 @@ def init_db():
         conn.execute("INSERT INTO shadow_portfolio (balance, total_trades, total_pnl) VALUES (?,0,0.0)",
                      (cfg.get("shadow_paper_balance", 500.0),))
         conn.commit()
+    conn.close()
+
+def migrate_db():
+    """Add new columns to existing tables without breaking existing data."""
+    conn = db()
+    for sql in [
+        "ALTER TABLE positions ADD COLUMN highest_price REAL DEFAULT NULL",
+        "ALTER TABLE positions ADD COLUMN stop_level    REAL DEFAULT NULL",
+        "ALTER TABLE positions ADD COLUMN partial_sold  INTEGER DEFAULT 0",
+    ]:
+        try: conn.execute(sql)
+        except Exception: pass  # Column already exists
     conn.close()
 
 def db():
@@ -271,6 +289,48 @@ def compute_macd(closes: list) -> tuple:
     macd = e12 - e26
     return macd, macd * 0.8
 
+def compute_adx(highs: list, lows: list, closes: list, period: int = 14) -> float:
+    """Average Directional Index. >25 = trending, <20 = ranging."""
+    if len(closes) < period + 2: return 20.0
+    tr_list, plus_dm, minus_dm = [], [], []
+    for i in range(1, len(closes)):
+        h, l, pc = highs[i], lows[i], closes[i-1]
+        tr = max(h - l, abs(h - pc), abs(l - pc))
+        pdm = (highs[i] - highs[i-1]) if (highs[i] - highs[i-1]) > (lows[i-1] - lows[i]) else 0
+        mdm = (lows[i-1] - lows[i]) if (lows[i-1] - lows[i]) > (highs[i] - highs[i-1]) else 0
+        tr_list.append(tr); plus_dm.append(max(pdm, 0)); minus_dm.append(max(mdm, 0))
+    if len(tr_list) < period: return 20.0
+    def ws(data, n):
+        s = [sum(data[:n])]
+        for v in data[n:]: s.append(s[-1] - s[-1]/n + v)
+        return s
+    atr = ws(tr_list, period); pdi_r = ws(plus_dm, period); mdi_r = ws(minus_dm, period)
+    dx_list = []
+    for i in range(len(atr)):
+        if atr[i] == 0: continue
+        pdi = 100 * pdi_r[i] / atr[i]; mdi = 100 * mdi_r[i] / atr[i]
+        if (pdi + mdi) == 0: continue
+        dx_list.append(100 * abs(pdi - mdi) / (pdi + mdi))
+    if len(dx_list) < period: return 20.0
+    return round(sum(dx_list[-period:]) / period, 2)
+
+def compute_bollinger(closes: list, period: int = 20, mult: float = 2.0) -> tuple:
+    """Returns (upper, middle, lower) Bollinger Bands."""
+    if len(closes) < period:
+        m = closes[-1] if closes else 0; return m, m, m
+    w = closes[-period:]; mid = sum(w) / period
+    std = (sum((x - mid)**2 for x in w) / period) ** 0.5
+    return round(mid + mult * std, 6), round(mid, 6), round(mid - mult * std, 6)
+
+def compute_rsi_series(closes: list, period: int = 14, count: int = 5) -> list:
+    """Returns last `count` RSI values to show momentum direction."""
+    results = []
+    for i in range(count, 0, -1):
+        end = len(closes) - i + 1
+        sub = closes[:end]
+        results.append(round(compute_rsi(sub, period), 1) if len(sub) >= period + 2 else 50.0)
+    return results
+
 def build_market_summary(pair: str) -> dict:
     candles = get_candles(pair)
     price   = get_price(pair)
@@ -280,22 +340,29 @@ def build_market_summary(pair: str) -> dict:
     highs  = [float(c["high"])  for c in candles]
     lows   = [float(c["low"])   for c in candles]
     vols   = [float(c["volume"]) for c in candles]
-    rsi         = compute_rsi(closes)
-    ema20       = compute_ema(closes, 20)
-    ema50       = compute_ema(closes, min(50, len(closes)))
-    macd, msig  = compute_macd(closes)
-    avg_vol     = sum(vols[-24:]) / 24 if vols else 0
-    pct_change  = ((closes[-1] - closes[-24]) / closes[-24] * 100) if len(closes) >= 24 else 0
+    rsi           = compute_rsi(closes)
+    ema20         = compute_ema(closes, 20)
+    ema50         = compute_ema(closes, min(50, len(closes)))
+    macd, msig    = compute_macd(closes)
+    adx           = compute_adx(highs, lows, closes)
+    bb_u, bb_m, bb_l = compute_bollinger(closes)
+    rsi_series    = compute_rsi_series(closes, count=5)
+    avg_vol       = sum(vols[-24:]) / 24 if vols else 0
+    pct_change    = ((closes[-1] - closes[-24]) / closes[-24] * 100) if len(closes) >= 24 else 0
+    regime = "TREND" if adx > 25 else ("RANGE" if adx < 20 else "NEUTRAL")
     return {
         "pair": pair, "price": price,
         "rsi": round(rsi, 2), "ema20": round(ema20, 2), "ema50": round(ema50, 2),
         "macd": round(macd, 2), "macd_signal": round(msig, 2),
+        "adx": adx, "regime": regime,
+        "bb_upper": bb_u, "bb_mid": bb_m, "bb_lower": bb_l,
+        "rsi_series": rsi_series,
         "24h_high": max(highs[-24:]) if highs else price,
         "24h_low":  min(lows[-24:])  if lows  else price,
         "24h_change_pct": round(pct_change, 2),
         "volume_vs_avg":  round(vols[-1] / avg_vol, 2) if avg_vol else 1.0,
         "candles_count":  len(candles),
-        "closes": closes[-24:],
+        "closes": closes[-10:],
     }
 
 # ─── News ─────────────────────────────────────────────────────────────────────
@@ -418,15 +485,18 @@ def get_learning_context() -> str:
     return ctx
 
 def log_trade_outcome(pair: str, signal: str, entry_price: float,
-                      exit_price: float, pnl_pct: float, indicators_json: str):
-    """Record a realized trade outcome for learning (called on TP/SL close)."""
-    outcome = "WIN" if pnl_pct > 0 else "LOSS"
+                      exit_price: float, pnl_pct: float, indicators_json: str,
+                      deduct_fees: bool = True):
+    """Record a realized trade outcome for learning.
+    deduct_fees=True subtracts round-trip taker fee drag from paper/shadow pnl."""
+    net_pnl = pnl_pct - (2 * TAKER_FEE * 100) if deduct_fees else pnl_pct
+    outcome = "WIN" if net_pnl > 0 else "LOSS"
     conn = db()
     conn.execute(
         """INSERT INTO outcomes
            (signal_id,pair,signal,entry_price,check_price,pnl_pct,outcome,indicators,evaluated_at)
            VALUES (?,?,?,?,?,?,?,?,?)""",
-        (None, pair, signal, entry_price, exit_price, round(pnl_pct, 3),
+        (None, pair, signal, entry_price, exit_price, round(net_pnl, 3),
          outcome, indicators_json, datetime.now(timezone.utc).isoformat())
     )
     conn.commit(); conn.close()
@@ -489,7 +559,8 @@ def paper_buy(pair: str, usd_amount: float, price: float) -> dict:
         usd_amount = min(usd_amount, pf["usd_balance"])
         if usd_amount < 0.5: return {"error": "Insufficient USD"}
         coin = pair.replace("-USD", "")
-        amt  = usd_amount / price
+        fee  = usd_amount * TAKER_FEE
+        amt  = (usd_amount - fee) / price
         pf["usd_balance"] -= usd_amount
         pf["holdings"][coin] = pf["holdings"].get(coin, 0) + amt
         update_paper_portfolio(pf["usd_balance"], pf["holdings"])
@@ -501,32 +572,58 @@ def paper_sell(pair: str, price: float) -> dict:
         coin = pair.replace("-USD", "")
         amt  = pf["holdings"].get(coin, 0)
         if amt <= 0: return {"error": "No holdings"}
-        usd = amt * price
+        usd = amt * price * (1 - TAKER_FEE)
         pf["usd_balance"] += usd
         pf["holdings"][coin] = 0
         update_paper_portfolio(pf["usd_balance"], pf["holdings"])
         return {"paper": True, "side": "SELL", "price": price, "usd": usd, "amount": amt}
 
+def paper_sell_partial(pair: str, price: float, frac: float = 0.5) -> dict:
+    with portfolio_lock:
+        pf   = get_paper_portfolio()
+        coin = pair.replace("-USD", "")
+        amt  = pf["holdings"].get(coin, 0)
+        if amt <= 0: return {"error": "No holdings"}
+        sell_amt = amt * frac
+        usd = sell_amt * price * (1 - TAKER_FEE)
+        pf["usd_balance"] += usd
+        pf["holdings"][coin] = amt - sell_amt
+        update_paper_portfolio(pf["usd_balance"], pf["holdings"])
+        return {"paper": True, "side": "SELL", "price": price, "usd": usd, "amount": sell_amt}
+
 # ─── Position Tracking ────────────────────────────────────────────────────────
 def get_position(pair: str) -> Optional[dict]:
     conn = db()
     row = conn.execute(
-        "SELECT pair, entry_price, amount, usd_invested, opened_at FROM positions WHERE pair=?", (pair,)
+        "SELECT pair,entry_price,amount,usd_invested,opened_at,highest_price,stop_level,partial_sold FROM positions WHERE pair=?",
+        (pair,)
     ).fetchone()
     conn.close()
     if not row: return None
-    return dict(zip(["pair","entry_price","amount","usd_invested","opened_at"], row))
+    return dict(zip(["pair","entry_price","amount","usd_invested","opened_at",
+                      "highest_price","stop_level","partial_sold"], row))
 
-def open_position(pair: str, price: float, amount: float, usd_invested: float):
+def update_position_trail(pair: str, highest_price: float,
+                          stop_level: Optional[float], partial_sold: int):
     conn = db()
     conn.execute(
-        """INSERT INTO positions (pair, entry_price, amount, usd_invested, opened_at)
-           VALUES (?,?,?,?,?)
+        "UPDATE positions SET highest_price=?, stop_level=?, partial_sold=? WHERE pair=?",
+        (highest_price, stop_level, partial_sold, pair)
+    )
+    conn.close()
+
+def open_position(pair: str, price: float, amount: float, usd_invested: float):
+    sl_pct     = cfg.get("stop_loss_pct", 1.5)
+    stop_level = price * (1 - sl_pct / 100)
+    conn = db()
+    conn.execute(
+        """INSERT INTO positions (pair,entry_price,amount,usd_invested,opened_at,highest_price,stop_level,partial_sold)
+           VALUES (?,?,?,?,?,?,?,0)
            ON CONFLICT(pair) DO UPDATE SET
              entry_price=(entry_price*amount + excluded.entry_price*excluded.amount)/(amount+excluded.amount),
              amount=amount+excluded.amount,
              usd_invested=usd_invested+excluded.usd_invested""",
-        (pair, price, amount, usd_invested, datetime.now(timezone.utc).isoformat())
+        (pair, price, amount, usd_invested, datetime.now(timezone.utc).isoformat(), price, stop_level)
     )
     conn.commit(); conn.close()
 
@@ -604,23 +701,56 @@ def check_shadow_tp_sl(pair: str) -> bool:
     current = get_price(pair)
     if not current: return False
     pct = (current - pos["entry_price"]) / pos["entry_price"] * 100
-    return pct >= cfg.get("take_profit_pct", 1.0) or pct <= -cfg.get("stop_loss_pct", 1.5)
+    tp = cfg.get("partial_tp_pct", 3.0)
+    sl = cfg.get("stop_loss_pct",  1.5)
+    return pct >= tp or pct <= -sl
 
-def check_tp_sl(pair: str) -> Optional[str]:
-    """Return 'SELL' if take-profit or stop-loss triggered, else None."""
+def check_exit(pair: str) -> Optional[str]:
+    """Multi-target trailing-stop exit logic.
+    Returns 'PARTIAL_SELL' (take 50% at +3%), 'SELL' (stop hit), or None."""
     pos = get_position(pair)
     if not pos or not pos["entry_price"]: return None
     current = get_price(pair)
     if not current: return None
-    pct = (current - pos["entry_price"]) / pos["entry_price"] * 100
-    tp = cfg.get("take_profit_pct", 3.0)
-    sl = cfg.get("stop_loss_pct",  2.0)
-    if pct >= tp:
-        log.info(f"{pair}: TAKE PROFIT triggered +{pct:.2f}% (threshold +{tp}%)")
-        return "SELL"
-    if pct <= -sl:
-        log.info(f"{pair}: STOP LOSS triggered {pct:.2f}% (threshold -{sl}%)")
-        return "SELL"
+
+    entry      = pos["entry_price"]
+    pct        = (current - entry) / entry * 100
+    highest    = pos.get("highest_price") or entry
+    stop_lvl   = pos.get("stop_level")
+    partial    = pos.get("partial_sold", 0)
+    sl_pct     = cfg.get("stop_loss_pct", 1.5)
+    partial_tp = cfg.get("partial_tp_pct", 3.0)
+    trail_pct  = cfg.get("trailing_stop_pct", 2.0)
+
+    # Update high watermark
+    new_high = max(highest, current)
+    if new_high != highest:
+        update_position_trail(pair, new_high, stop_lvl, partial)
+        highest = new_high
+
+    if stop_lvl is None:
+        stop_lvl = entry * (1 - sl_pct / 100)
+
+    if not partial:
+        if pct >= partial_tp:
+            return "PARTIAL_SELL"
+        if current <= stop_lvl:
+            log.info(f"{pair}: Stop-loss @ ${current:.4f} ({pct:+.2f}%)")
+            return "SELL"
+    else:
+        # After partial sell — stop is at breakeven, trail from +5% high
+        high_pct = (highest - entry) / entry * 100
+        if high_pct >= 5.0:
+            trail_stop = highest * (1 - trail_pct / 100)
+            new_stop   = max(stop_lvl, trail_stop)
+        else:
+            new_stop = stop_lvl  # Already set to breakeven
+        if new_stop != stop_lvl:
+            update_position_trail(pair, highest, new_stop, partial)
+            stop_lvl = new_stop
+        if current <= stop_lvl:
+            log.info(f"{pair}: Trailing stop @ ${current:.4f} (stop=${stop_lvl:.4f}, {pct:+.2f}%)")
+            return "SELL"
     return None
 
 def get_position_context(pair: str) -> str:
@@ -628,11 +758,76 @@ def get_position_context(pair: str) -> str:
     if not pos: return ""
     current = get_price(pair)
     if not current: return ""
-    pct = (current - pos["entry_price"]) / pos["entry_price"] * 100
+    pct      = (current - pos["entry_price"]) / pos["entry_price"] * 100
     direction = "up" if pct >= 0 else "down"
-    return (f"\n\nOpen position: bought {pair} at ${pos['entry_price']:.4f}, "
-            f"currently {direction} {abs(pct):.2f}% (${current:.4f}). "
-            f"Take profit at +{cfg.get('take_profit_pct',3.0)}%, stop loss at -{cfg.get('stop_loss_pct',2.0)}%.")
+    stop      = pos.get("stop_level") or pos["entry_price"] * (1 - cfg.get("stop_loss_pct", 1.5) / 100)
+    partial   = pos.get("partial_sold", 0)
+    ctx = (f"\n\nOpen position: bought {pair} at ${pos['entry_price']:.4f}, "
+           f"currently {direction} {abs(pct):.2f}% (${current:.4f}). Stop: ${stop:.4f}.")
+    if partial:
+        ctx += " 50% already taken at +3%, remainder on trailing stop."
+    return ctx
+
+# ─── Trading Guards ───────────────────────────────────────────────────────────
+
+def get_daily_realized_pnl() -> float:
+    """Sum of realized USD P&L from closed trades today."""
+    today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+    conn  = db()
+    rows  = conn.execute(
+        "SELECT pair,side,price,amount FROM trades WHERE timestamp >= ? ORDER BY timestamp ASC",
+        (today,)
+    ).fetchall()
+    conn.close()
+    open_buys: dict = {}
+    pnl = 0.0
+    for pair, side, price, amount in rows:
+        if side == "BUY":
+            open_buys[pair] = {"price": price, "amount": amount or 0}
+        elif side == "SELL" and pair in open_buys:
+            b = open_buys.pop(pair)
+            pnl += (price - b["price"]) * (amount or b["amount"])
+    return pnl
+
+def is_daily_loss_limit_hit() -> bool:
+    limit_usd = cfg.get("trading_budget_usd", 100.0) * cfg.get("daily_loss_limit_pct", 3.0) / 100
+    pnl = get_daily_realized_pnl()
+    if pnl < -limit_usd:
+        log.warning(f"Daily loss limit hit: ${pnl:.2f} (limit -${limit_usd:.2f}). Pausing trading.")
+        return True
+    return False
+
+def is_trading_hours() -> bool:
+    hours = cfg.get("trading_hours_utc", [0, 24])
+    now_h = datetime.now(timezone.utc).hour
+    return hours[0] <= now_h < hours[1]
+
+def get_disabled_pairs() -> set:
+    """Auto-disable pairs with <40% win rate after ≥20 real BUY outcomes."""
+    if not cfg.get("learning_enabled", True): return set()
+    conn = db()
+    rows = conn.execute(
+        """SELECT pair, COUNT(*) total,
+           SUM(CASE WHEN outcome='WIN' THEN 1 ELSE 0 END) wins
+           FROM outcomes WHERE signal='BUY'
+           GROUP BY pair HAVING COUNT(*) >= 20""",
+    ).fetchall()
+    conn.close()
+    disabled = set()
+    for pair, total, wins in rows:
+        if (wins or 0) / total < 0.40:
+            disabled.add(pair)
+    return disabled
+
+def get_last_trade_outcome(pair: str) -> str:
+    conn = db()
+    row  = conn.execute(
+        "SELECT pnl_pct, outcome FROM outcomes WHERE pair=? AND signal='BUY' ORDER BY id DESC LIMIT 1",
+        (pair,)
+    ).fetchone()
+    conn.close()
+    if not row: return "No recent closed trades"
+    return f"{row[1]} ({row[0]:+.2f}%)"
 
 def rebuild_positions_from_history():
     """Reconstruct open positions from trade history on startup."""
@@ -713,6 +908,24 @@ def place_order(pair: str, side: str, usd_amount: float) -> dict:
         log.error(f"Live order failed {side} {pair}: {e}")
         return {"error": str(e)}
 
+def _live_partial_sell(pair: str, base_size: float) -> dict:
+    """Live Coinbase order for a partial (fractional) sell."""
+    path = "/api/v3/brokerage/orders"
+    body = json.dumps({
+        "client_order_id": f"tb_{int(time.time())}_partial",
+        "product_id": pair, "side": "SELL",
+        "order_configuration": {"market_market_ioc": {"base_size": str(round(base_size, 8))}},
+    })
+    try:
+        r = requests.post(COINBASE_BASE + path, headers=cb_headers("POST", path), data=body, timeout=10)
+        r.raise_for_status()
+        resp = r.json()
+        if not resp.get("success", True):
+            return {"error": resp.get("error_response", "Rejected")}
+        return resp
+    except Exception as e:
+        return {"error": str(e)}
+
 # ─── AI Decision Engine ───────────────────────────────────────────────────────
 SYSTEM_PROMPT = """You are a disciplined, profit-focused crypto trading AI. Your only goal is to make money. Capital preservation comes first.
 
@@ -730,18 +943,32 @@ Rules:
 - HOLD is the right answer when signals conflict. Never force a trade.
 - Realize profits. A held gain is not a gain. Incomplete SELL = lost opportunity.
 
+Regime rules (use ADX):
+- TREND regime (ADX > 25): follow trend. BUY when MACD crosses up + EMA20 > EMA50. SELL on MACD cross down.
+- RANGE regime (ADX < 20): mean-revert. BUY when RSI < 35 + price near lower Bollinger Band. SELL when RSI > 65.
+- RSI divergence: RSI falling while price rising = bearish divergence → SELL/HOLD. RSI rising while price falling = bullish divergence → BUY lean.
+- RSI history shows momentum direction — a series like 45→50→55 is accelerating, 65→60→55 is decelerating.
+
 Respond ONLY in JSON: {"signal":"BUY|SELL|HOLD","confidence":0.75,"reasoning":"2 sentences max"}"""
 
 def ai_decision(market_data: dict) -> dict:
+    closes     = market_data.get("closes", [])
+    rsi_series = market_data.get("rsi_series", [])
+    last_trade = get_last_trade_outcome(market_data["pair"])
     prompt = f"""Market snapshot for {market_data['pair']}:
 
-Price:       ${market_data.get('price', 'N/A')}
-RSI (14):    {market_data.get('rsi', 'N/A')}
-EMA20/50:    {market_data.get('ema20', 'N/A')} / {market_data.get('ema50', 'N/A')}
-MACD:        {market_data.get('macd', 'N/A')} (signal {market_data.get('macd_signal', 'N/A')})
-24h Change:  {market_data.get('24h_change_pct', 'N/A')}%
-24h Hi/Lo:   ${market_data.get('24h_high', 'N/A')} / ${market_data.get('24h_low', 'N/A')}
-Volume Ratio:{market_data.get('volume_vs_avg', 'N/A')}x
+Price:          ${market_data.get('price', 'N/A')}
+RSI (14):       {market_data.get('rsi', 'N/A')}
+RSI history:    {', '.join(str(r) for r in rsi_series)} (oldest→newest)
+Last 10 closes: {', '.join(f'{c:.2f}' for c in closes)}
+EMA20/50:       {market_data.get('ema20', 'N/A')} / {market_data.get('ema50', 'N/A')}
+MACD:           {market_data.get('macd', 'N/A')} (signal {market_data.get('macd_signal', 'N/A')})
+ADX/Regime:     {market_data.get('adx', 'N/A')} → {market_data.get('regime', 'N/A')}
+Bollinger:      {market_data.get('bb_upper', 'N/A')} / {market_data.get('bb_mid', 'N/A')} / {market_data.get('bb_lower', 'N/A')}
+24h Change:     {market_data.get('24h_change_pct', 'N/A')}%
+24h Hi/Lo:      ${market_data.get('24h_high', 'N/A')} / ${market_data.get('24h_low', 'N/A')}
+Volume Ratio:   {market_data.get('volume_vs_avg', 'N/A')}x
+Last trade:     {last_trade}
 {get_news_context()}{get_learning_context()}{get_position_context(market_data['pair'])}
 
 Give your JSON signal."""
@@ -785,22 +1012,85 @@ def trading_loop():
     tick = 0
     while bot_running:
         tick += 1
+
+        # ── Time-of-day filter ────────────────────────────────────────────────
+        if not is_trading_hours():
+            hours = cfg.get("trading_hours_utc", [0, 24])
+            log.info(f"Outside trading hours (UTC {datetime.now(timezone.utc).hour}h, window {hours[0]}-{hours[1]})")
+            time.sleep(cfg.get("poll_interval_sec", 600))
+            continue
+
+        # ── Daily loss limit ──────────────────────────────────────────────────
+        if is_daily_loss_limit_hit():
+            time.sleep(3600)
+            continue
+
+        # ── Per-pair auto-disable (compute once per tick) ─────────────────────
+        disabled_pairs = get_disabled_pairs()
+        if disabled_pairs:
+            log.info(f"Auto-disabled pairs: {disabled_pairs}")
+
         if tick % 5 == 0:
             try: evaluate_outcomes()
             except Exception as e: log.error(f"Eval error: {e}")
+
         for pair in list(bot_status["pairs"]):
             if not bot_running: break
+
+            if pair in disabled_pairs:
+                continue
+
             try:
-                # ── Shadow paper TP/SL (always runs, free of live budget) ─────
+                # ── Shadow paper TP/SL (always runs) ─────────────────────────
                 if check_shadow_tp_sl(pair):
                     p = get_price(pair)
                     if p: shadow_trade(pair, "SELL", p, None)
 
-                # ── Live TP/SL check before AI ────────────────────────────────
-                tp_sl = check_tp_sl(pair)
-                if tp_sl == "SELL":
+                # ── Trailing stop / multi-target exit ─────────────────────────
+                exit_sig = check_exit(pair)
+
+                if exit_sig == "PARTIAL_SELL":
                     price = get_price(pair)
                     pos   = get_position(pair)
+                    if price and pos and not pos.get("partial_sold"):
+                        sell_amt = pos["amount"] * 0.5
+                        sell_usd = sell_amt * price
+                        result   = (paper_sell_partial(pair, price, 0.5) if cfg["paper_trading"]
+                                    else _live_partial_sell(pair, sell_amt))
+                        if "error" not in result:
+                            entry   = pos["entry_price"]
+                            pnl_pct = (price - entry) / entry * 100
+                            new_stop = entry * 1.001
+                            now_ts   = datetime.now(timezone.utc).isoformat()
+                            conn = db()
+                            conn.execute(
+                                "INSERT INTO trades (timestamp,pair,side,price,amount,usd_value,ai_reasoning,paper) VALUES (?,?,?,?,?,?,?,?)",
+                                (now_ts, pair, "SELL", price, sell_amt, sell_usd,
+                                 f"Partial TP {pnl_pct:+.2f}%", 1 if cfg["paper_trading"] else 0)
+                            )
+                            conn.execute(
+                                "INSERT INTO signals (timestamp,pair,signal,confidence,reasoning,price,indicators) VALUES (?,?,?,?,?,?,?)",
+                                (now_ts, pair, "SELL", 0.95,
+                                 f"Partial TP {pnl_pct:+.2f}%: 50% sold, trailing rest", price, None)
+                            )
+                            conn.commit(); conn.close()
+                            update_position_trail(pair, pos.get("highest_price") or price, new_stop, 1)
+                            conn3 = db()
+                            conn3.execute("UPDATE positions SET amount=?, usd_invested=? WHERE pair=?",
+                                          (pos["amount"] * 0.5, pos["usd_invested"] * 0.5, pair))
+                            conn3.close()
+                            log.info(f"{pair}: Partial TP {pnl_pct:+.2f}%, stop → BE ${new_stop:.4f}")
+                            bot_status["last_signal"] = {
+                                "signal": "SELL", "pair": pair, "price": price,
+                                "confidence": 0.95,
+                                "reasoning": f"Partial TP {pnl_pct:+.2f}%",
+                                "time": now_ts,
+                            }
+                    continue
+
+                elif exit_sig == "SELL":
+                    price  = get_price(pair)
+                    pos    = get_position(pair)
                     result = place_order(pair, "SELL", 0)
                     if "error" not in result and price and pos:
                         amt     = pos["amount"]
@@ -813,15 +1103,12 @@ def trading_loop():
                         conn.execute(
                             "INSERT INTO trades (timestamp,pair,side,price,amount,usd_value,ai_reasoning,paper) VALUES (?,?,?,?,?,?,?,?)",
                             (now_ts, pair, "SELL", price, amt, usd_val,
-                             f"Auto: {reason} {pnl_pct:+.2f}%",
-                             1 if cfg["paper_trading"] else 0)
+                             f"Auto: {reason} {pnl_pct:+.2f}%", 1 if cfg["paper_trading"] else 0)
                         )
-                        # Also write a signal record so the dashboard feed shows it
                         conn.execute(
                             "INSERT INTO signals (timestamp,pair,signal,confidence,reasoning,price,indicators) VALUES (?,?,?,?,?,?,?)",
                             (now_ts, pair, "SELL", 0.99,
-                             f"{reason} triggered: {pnl_pct:+.2f}% vs entry ${entry:.4f}",
-                             price, None)
+                             f"{reason}: {pnl_pct:+.2f}% vs entry ${entry:.4f}", price, None)
                         )
                         conn.commit(); conn.close()
                         ind_snap = json.dumps({"entry_price": entry, "exit_price": price,
@@ -830,47 +1117,53 @@ def trading_loop():
                         close_position(pair)
                         bot_status["last_signal"] = {
                             "signal": "SELL", "pair": pair, "price": price,
-                            "confidence": 0.99,
-                            "reasoning": f"{reason} triggered: {pnl_pct:+.2f}%",
+                            "confidence": 0.99, "reasoning": f"{reason}: {pnl_pct:+.2f}%",
                             "time": now_ts,
                         }
                         log.info(f"{pair}: {reason} SELL @ ${price} ({pnl_pct:+.2f}%)")
                     continue
 
+                # ── AI analysis ───────────────────────────────────────────────
                 market = build_market_summary(pair)
                 if market.get("error"): continue
                 decision = ai_decision(market)
                 ind_json = json.dumps({
                     "rsi": market.get("rsi"), "ema20": market.get("ema20"),
                     "ema50": market.get("ema50"), "macd": market.get("macd"),
+                    "adx": market.get("adx"), "regime": market.get("regime"),
                 })
-                log.info(f"{pair}: {decision['signal']} conf={decision['confidence']:.2f}")
+                log.info(f"{pair}: {decision['signal']} conf={decision['confidence']:.2f} [{market.get('regime','?')} ADX={market.get('adx',0)}]")
 
-                # ── Skip BUY if already holding ───────────────────────────────
+                # ── Skip BUY if already holding this pair ─────────────────────
                 if decision["signal"] == "BUY" and get_position(pair):
                     log.info(f"{pair}: already holding, skipping BUY")
                     bot_status["last_signal"] = {
                         **decision, "signal": "HOLD", "pair": pair,
-                        "price": market.get("price"),
-                        "time": datetime.now().isoformat()
+                        "price": market.get("price"), "time": datetime.now().isoformat()
                     }
                     continue
 
-                # ── Budget cap: don't invest beyond trading_budget_usd ────────
+                # ── Correlation guard: max N simultaneous positions ────────────
                 budget = cfg.get("trading_budget_usd", 100.0)
                 if decision["signal"] == "BUY":
+                    conn = db()
+                    open_count = conn.execute("SELECT COUNT(*) FROM positions").fetchone()[0]
+                    conn.close()
+                    max_pos = cfg.get("max_positions", 1)
+                    if open_count >= max_pos:
+                        log.info(f"Correlation guard: {open_count}/{max_pos} positions open, skipping {pair}")
+                        continue
                     invested  = get_total_invested()
                     remaining = budget - invested
                     if remaining < 1.0:
-                        log.info(f"Budget cap: ${invested:.2f}/${budget:.2f} invested, skipping {pair} BUY")
+                        log.info(f"Budget cap: ${invested:.2f}/${budget:.2f} invested, skipping {pair}")
                         continue
 
-                # ── Skip AI SELL if we have no open position ─────────────────
+                # ── Skip AI SELL if no open position ──────────────────────────
                 if decision["signal"] == "SELL" and not get_position(pair):
                     continue
 
-                # Write signal immediately then close — avoids holding a write
-                # lock open across place_order / shadow_trade calls below
+                # Write signal (close conn before sub-operations)
                 now_ts = datetime.now(timezone.utc).isoformat()
                 conn = db()
                 try:
@@ -889,14 +1182,9 @@ def trading_loop():
                         pf        = get_paper_portfolio()
                         usd_avail = pf.get("usd_balance", 0)
                     else:
-                        base_avail = budget
-                        if decision["signal"] == "BUY":
-                            base_avail = min(budget, budget - get_total_invested())
-                        usd_avail = base_avail
-                    usd_amt = min(
-                        max(1.0, usd_avail * cfg.get("trade_amount_pct", 0.05)),
-                        usd_avail
-                    )
+                        base_avail = min(budget, budget - get_total_invested()) if decision["signal"] == "BUY" else budget
+                        usd_avail  = base_avail
+                    usd_amt = min(max(1.0, usd_avail * cfg.get("trade_amount_pct", 0.05)), usd_avail)
                     if usd_amt >= 1.0:
                         result = place_order(pair, decision["signal"], usd_amt)
                         if "error" not in result:
@@ -922,19 +1210,18 @@ def trading_loop():
                                     log_trade_outcome(pair, "BUY", pos["entry_price"], price, pnl_pct, ind_json)
                                 close_position(pair)
 
-                # ── Shadow paper trades ALL signals — no confidence gate ────
+                # ── Shadow trades all signals (no confidence gate) ────────────
                 if decision["signal"] in ("BUY", "SELL"):
                     try: shadow_trade(pair, decision["signal"], market.get("price", 0), ind_json)
                     except Exception as se: log.error(f"Shadow trade error {pair}: {se}")
 
                 bot_status["last_signal"] = {
                     **decision, "pair": pair,
-                    "price": market.get("price"),
-                    "time": datetime.now().isoformat()
+                    "price": market.get("price"), "time": datetime.now().isoformat()
                 }
             except Exception as e:
                 log.error(f"Loop error {pair}: {e}")
-        time.sleep(cfg.get("poll_interval_sec", 60))
+        time.sleep(cfg.get("poll_interval_sec", 600))
 
 # ─── Flask Routes ──────────────────────────────────────────────────────────────
 @app.route("/api/status")
@@ -1300,6 +1587,7 @@ def api_reset_portfolio():
 
 if __name__ == "__main__":
     init_db()
+    migrate_db()
     rebuild_positions_from_history()
     log.info(f"Trade Bot starting — paper={cfg['paper_trading']} model={cfg['ollama_model']} pairs={len(cfg['pairs'])}")
     if cfg.get("news_enabled", True):
